@@ -4,9 +4,11 @@ name: ezeep Build
 # Container Registry (<login server>/ezeep/...). Derived from release-head.yml,
 # but does not run the unit/e2e suites (pr.yaml covers those).
 #
-# Required secrets: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET of a service principal
-# with the AcrPush role on the registry.
-# Optional variable: ACR_LOGIN_SERVER to push to a different registry.
+# Authenticates with GitHub OIDC (no stored secret) as the app registration
+# "github-oidc-ezeep-ingress-nginx", which has AcrPush on the registry and a
+# federated credential for this repository's ezeep-build branch only.
+# Optional variables: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID and
+# ACR_LOGIN_SERVER override the defaults below.
 on:
   push:
     branches:
@@ -19,6 +21,9 @@ permissions:
 env:
   ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || 'ezeep20dev.azurecr.io' }}
   IMAGE_PREFIX: ${{ vars.ACR_LOGIN_SERVER || 'ezeep20dev.azurecr.io' }}/ezeep
+  AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID || '72e6cdc2-2d3e-4776-adc6-e0930b4e1fab' }}
+  AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID || '64d5a305-62c8-419e-a69f-cf5053f9d5de' }}
+  AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID || '661c04ac-d727-4138-9abe-81103faa1e38' }}
 
 concurrency:
   group: ezeep-build-${{ github.ref }}
@@ -28,6 +33,7 @@ jobs:
   meta:
     permissions:
       contents: read
+      id-token: write # Azure OIDC login
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -36,17 +42,16 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v7
 
-    # Fail fast instead of after the long base image build
-    - name: Check registry credentials
-      env:
-        AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-        AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      run: |
-        if [[ -z "$AZURE_CLIENT_ID" || -z "$AZURE_CLIENT_SECRET" ]]; then
-          echo "::error::Secrets AZURE_CLIENT_ID and AZURE_CLIENT_SECRET are required to push to ${ACR_LOGIN_SERVER}"
-          exit 1
-        fi
-        echo "$AZURE_CLIENT_SECRET" | docker login "$ACR_LOGIN_SERVER" -u "$AZURE_CLIENT_ID" --password-stdin
+    # Fail fast on registry access instead of after the long base image build
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to ACR
+      run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 
     - name: Compute tags
       id: meta
@@ -115,17 +120,21 @@ jobs:
     needs: meta
     permissions:
       contents: read
+      id-token: write # Azure OIDC login
     runs-on: ubuntu-latest
     steps:
     - name: Check out code
       uses: actions/checkout@v7
 
-    - name: Login to ACR
-      uses: docker/login-action@v4
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
       with:
-        registry: ${{ env.ACR_LOGIN_SERVER }}
-        username: ${{ secrets.AZURE_CLIENT_ID }}
-        password: ${{ secrets.AZURE_CLIENT_SECRET }}
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to ACR
+      run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v4
@@ -159,6 +168,7 @@ jobs:
     needs: [meta, build-base-image, build-binary]
     permissions:
       contents: read
+      id-token: write # Azure OIDC login
     runs-on: ubuntu-latest
     steps:
     - name: Check out code
@@ -177,12 +187,15 @@ jobs:
         mv ./bin/binaries-arm64 ./rootfs/bin/arm64
         chmod +x ./rootfs/bin/amd64/* ./rootfs/bin/arm64/*
 
-    - name: Login to ACR
-      uses: docker/login-action@v4
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
       with:
-        registry: ${{ env.ACR_LOGIN_SERVER }}
-        username: ${{ secrets.AZURE_CLIENT_ID }}
-        password: ${{ secrets.AZURE_CLIENT_SECRET }}
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to ACR
+      run: az acr login --name "${ACR_LOGIN_SERVER%%.*}"
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v4
