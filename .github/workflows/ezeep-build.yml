@@ -1,9 +1,12 @@
 name: ezeep Build
 
-# Builds the hardened controller images and pushes them to the GitHub Container
-# Registry of the repository owner (ghcr.io/<owner>/...). Derived from
-# release-head.yml, but needs no secrets besides the built-in GITHUB_TOKEN and
-# does not run the unit/e2e suites (pr.yaml covers those).
+# Builds the hardened controller images and pushes them to the ezeep Azure
+# Container Registry (<login server>/ezeep/...). Derived from release-head.yml,
+# but does not run the unit/e2e suites (pr.yaml covers those).
+#
+# Required secrets: AZURE_CLIENT_ID / AZURE_CLIENT_SECRET of a service principal
+# with the AcrPush role on the registry.
+# Optional variable: ACR_LOGIN_SERVER to push to a different registry.
 on:
   push:
     branches:
@@ -12,6 +15,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || 'ezeep20dev.azurecr.io' }}
+  IMAGE_PREFIX: ${{ vars.ACR_LOGIN_SERVER || 'ezeep20dev.azurecr.io' }}/ezeep
 
 concurrency:
   group: ezeep-build-${{ github.ref }}
@@ -23,18 +30,27 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     outputs:
-      registry: ${{ steps.meta.outputs.registry }}
       version: ${{ steps.meta.outputs.version }}
       branch_tag: ${{ steps.meta.outputs.branch_tag }}
     steps:
     - name: Check out code
       uses: actions/checkout@v7
 
-    - name: Compute registry and tags
+    # Fail fast instead of after the long base image build
+    - name: Check registry credentials
+      env:
+        AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      run: |
+        if [[ -z "$AZURE_CLIENT_ID" || -z "$AZURE_CLIENT_SECRET" ]]; then
+          echo "::error::Secrets AZURE_CLIENT_ID and AZURE_CLIENT_SECRET are required to push to ${ACR_LOGIN_SERVER}"
+          exit 1
+        fi
+        echo "$AZURE_CLIENT_SECRET" | docker login "$ACR_LOGIN_SERVER" -u "$AZURE_CLIENT_ID" --password-stdin
+
+    - name: Compute tags
       id: meta
       run: |
-        # GHCR requires a lowercase namespace
-        echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
         # Immutable tag, e.g. v1.15.1-abc1234
         echo "version=$(cat TAG)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
         # Moving tag named after the branch, e.g. ezeep-build
@@ -99,18 +115,17 @@ jobs:
     needs: meta
     permissions:
       contents: read
-      packages: write
     runs-on: ubuntu-latest
     steps:
     - name: Check out code
       uses: actions/checkout@v7
 
-    - name: Login to GHCR
+    - name: Login to ACR
       uses: docker/login-action@v4
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        registry: ${{ env.ACR_LOGIN_SERVER }}
+        username: ${{ secrets.AZURE_CLIENT_ID }}
+        password: ${{ secrets.AZURE_CLIENT_SECRET }}
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v4
@@ -130,8 +145,8 @@ jobs:
         platforms: linux/amd64,linux/arm64
         push: true
         tags: |
-          ${{ needs.meta.outputs.registry }}/kube-webhook-certgen:${{ needs.meta.outputs.version }}
-          ${{ needs.meta.outputs.registry }}/kube-webhook-certgen:${{ needs.meta.outputs.branch_tag }}
+          ${{ env.IMAGE_PREFIX }}/kube-webhook-certgen:${{ needs.meta.outputs.version }}
+          ${{ env.IMAGE_PREFIX }}/kube-webhook-certgen:${{ needs.meta.outputs.branch_tag }}
         build-args: |
           BASE_IMAGE=${{ env.KWC_BASE_IMAGE }}
           GOLANG_VERSION=${{ env.KWC_GOLANG_VERSION }}
@@ -144,7 +159,6 @@ jobs:
     needs: [meta, build-base-image, build-binary]
     permissions:
       contents: read
-      packages: write
     runs-on: ubuntu-latest
     steps:
     - name: Check out code
@@ -163,12 +177,12 @@ jobs:
         mv ./bin/binaries-arm64 ./rootfs/bin/arm64
         chmod +x ./rootfs/bin/amd64/* ./rootfs/bin/arm64/*
 
-    - name: Login to GHCR
+    - name: Login to ACR
       uses: docker/login-action@v4
       with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        registry: ${{ env.ACR_LOGIN_SERVER }}
+        username: ${{ secrets.AZURE_CLIENT_ID }}
+        password: ${{ secrets.AZURE_CLIENT_SECRET }}
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v4
@@ -195,8 +209,8 @@ jobs:
         platforms: linux/amd64,linux/arm64
         push: true
         tags: |
-          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller:${{ needs.meta.outputs.version }}
-          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller:${{ needs.meta.outputs.branch_tag }}
+          ${{ env.IMAGE_PREFIX }}/nginx-ingress-controller:${{ needs.meta.outputs.version }}
+          ${{ env.IMAGE_PREFIX }}/nginx-ingress-controller:${{ needs.meta.outputs.branch_tag }}
         build-contexts: |
           base=oci-layout://${{ github.workspace }}/base.oci
         build-args: |
@@ -217,8 +231,8 @@ jobs:
         platforms: linux/amd64,linux/arm64
         push: true
         tags: |
-          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller-chroot:${{ needs.meta.outputs.version }}
-          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller-chroot:${{ needs.meta.outputs.branch_tag }}
+          ${{ env.IMAGE_PREFIX }}/nginx-ingress-controller-chroot:${{ needs.meta.outputs.version }}
+          ${{ env.IMAGE_PREFIX }}/nginx-ingress-controller-chroot:${{ needs.meta.outputs.branch_tag }}
         build-contexts: |
           base=oci-layout://${{ github.workspace }}/base.oci
         build-args: |
