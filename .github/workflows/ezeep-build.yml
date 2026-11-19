@@ -1,0 +1,232 @@
+name: ezeep Build
+
+# Builds the hardened controller images and pushes them to the GitHub Container
+# Registry of the repository owner (ghcr.io/<owner>/...). Derived from
+# release-head.yml, but needs no secrets besides the built-in GITHUB_TOKEN and
+# does not run the unit/e2e suites (pr.yaml covers those).
+on:
+  push:
+    branches:
+      - ezeep-build
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ezeep-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      registry: ${{ steps.meta.outputs.registry }}
+      version: ${{ steps.meta.outputs.version }}
+      branch_tag: ${{ steps.meta.outputs.branch_tag }}
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v7
+
+    - name: Compute registry and tags
+      id: meta
+      run: |
+        # GHCR requires a lowercase namespace
+        echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+        # Immutable tag, e.g. v1.15.1-abc1234
+        echo "version=$(cat TAG)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        # Moving tag named after the branch, e.g. ezeep-build
+        echo "branch_tag=$(echo "${GITHUB_REF_NAME}" | tr -c 'A-Za-z0-9_.\n-' '-')" >> "$GITHUB_OUTPUT"
+
+  build-base-image:
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v7
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Build base image cache (${{ matrix.arch }})
+      uses: docker/build-push-action@v7
+      with:
+        context: ./images/nginx/rootfs
+        platforms: linux/${{ matrix.arch }}
+        cache-from: type=gha,scope=nginx-base-${{ matrix.arch }}-${{ github.ref_name }}
+        cache-to: type=gha,scope=nginx-base-${{ matrix.arch }}-${{ github.ref_name }},mode=min
+
+  build-binary:
+    needs: meta
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v7
+
+    - name: Build Binary
+      env:
+        ARCH: ${{ matrix.arch }}
+        TAG: ${{ needs.meta.outputs.version }}
+      run: ./scripts/build-binary
+
+    - name: Upload Binary
+      uses: actions/upload-artifact@v7
+      with:
+        name: binaries-${{ matrix.arch }}
+        path: rootfs/bin/${{ matrix.arch }}
+        retention-days: 2
+
+  build-certgen:
+    needs: meta
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v7
+
+    - name: Login to GHCR
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    - name: Get certgen build args
+      run: |
+        echo "KWC_BASE_IMAGE=$(cat NGINX_BASE)" >> $GITHUB_ENV
+        echo "KWC_GOLANG_VERSION=$(cat GOLANG_VERSION)" >> $GITHUB_ENV
+
+    - name: Build and push kube-webhook-certgen image
+      uses: docker/build-push-action@v7
+      with:
+        context: ./images/kube-webhook-certgen/rootfs
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ${{ needs.meta.outputs.registry }}/kube-webhook-certgen:${{ needs.meta.outputs.version }}
+          ${{ needs.meta.outputs.registry }}/kube-webhook-certgen:${{ needs.meta.outputs.branch_tag }}
+        build-args: |
+          BASE_IMAGE=${{ env.KWC_BASE_IMAGE }}
+          GOLANG_VERSION=${{ env.KWC_GOLANG_VERSION }}
+        labels: |
+          org.opencontainers.image.description=Ingress NGINX kube-webhook-certgen
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.licenses=Apache-2.0
+
+  build-controller-image:
+    needs: [meta, build-base-image, build-binary]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v7
+
+    - name: Download Binaries
+      uses: actions/download-artifact@v8
+      with:
+        pattern: binaries-*
+        path: ./bin
+
+    - name: Setup binaries in correct location, fix permissions
+      run: |
+        mkdir -p ./rootfs/bin
+        mv ./bin/binaries-amd64 ./rootfs/bin/amd64
+        mv ./bin/binaries-arm64 ./rootfs/bin/arm64
+        chmod +x ./rootfs/bin/amd64/* ./rootfs/bin/arm64/*
+
+    - name: Login to GHCR
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v4
+
+    # Assembles the multi-arch base image from the per-arch caches built above
+    - name: Build base image OCI layout (cached)
+      uses: docker/build-push-action@v7
+      with:
+        context: ./images/nginx/rootfs
+        platforms: linux/amd64,linux/arm64
+        cache-from: |
+          type=gha,scope=nginx-base-amd64-${{ github.ref_name }}
+          type=gha,scope=nginx-base-arm64-${{ github.ref_name }}
+        outputs: type=oci,dest=base.oci,tar=false
+
+    - name: Build and push controller image
+      uses: docker/build-push-action@v7
+      with:
+        context: ./rootfs
+        file: ./rootfs/Dockerfile
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller:${{ needs.meta.outputs.version }}
+          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller:${{ needs.meta.outputs.branch_tag }}
+        build-contexts: |
+          base=oci-layout://${{ github.workspace }}/base.oci
+        build-args: |
+          BASE_IMAGE=base
+          VERSION=${{ needs.meta.outputs.version }}
+          COMMIT_SHA=${{ github.sha }}
+          BUILD_ID=${{ github.run_id }}
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+        sbom: true
+        provenance: mode=max
+
+    - name: Build and push controller chroot image
+      uses: docker/build-push-action@v7
+      with:
+        context: ./rootfs
+        file: ./rootfs/Dockerfile-chroot
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller-chroot:${{ needs.meta.outputs.version }}
+          ${{ needs.meta.outputs.registry }}/nginx-ingress-controller-chroot:${{ needs.meta.outputs.branch_tag }}
+        build-contexts: |
+          base=oci-layout://${{ github.workspace }}/base.oci
+        build-args: |
+          BASE_IMAGE=base
+          VERSION=${{ needs.meta.outputs.version }}
+          COMMIT_SHA=${{ github.sha }}
+          BUILD_ID=${{ github.run_id }}
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+        sbom: true
+        provenance: mode=max
